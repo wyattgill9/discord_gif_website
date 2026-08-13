@@ -1,0 +1,9 @@
+{
+  "name": "discord-gif",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run serve.ts",
+    "test": "bun test"
+  }
+}
