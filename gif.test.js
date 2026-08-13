@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { cropRect, dither, encode, fitSize, frameTimes, sampleFrames } from "./gif.js";
+import { cropRect, dither, encode, fitSize, frameTimes, paletteSource, sampleFrames } from "./gif.js";
 
 // Synthetic RGBA frame — a horizontal gradient, which is exactly what banding shows up on.
 const frame = (w, h, tint = 0, alpha = 255) => {
@@ -28,6 +28,21 @@ test("more frames means more bytes", async () => {
 test("a transparent source still encodes", async () => {
   const bytes = await encode([frame(16, 16, 0, 0)], { delay: 100 });
   expect(Array.from(bytes.slice(0, 6))).toEqual([...Buffer.from("GIF89a")]);
+});
+
+test("paletteSource samples across the clip, not just the start", () => {
+  const one = frame(4, 4, 9);
+  expect(paletteSource([one])).toBe(one.data); // single image: no copying
+
+  // 100 frames, each tinted by its index. The palette must see the end of the clip too,
+  // or a video that changes color halfway through gets quantized against its opening shot.
+  const clip = Array.from({ length: 100 }, (_, i) => frame(4, 4, i));
+  const px = paletteSource(clip);
+  expect(px.length).toBe(8 * one.data.length); // 8 frames' worth, not all 100
+  const tints = new Set();
+  for (let i = 1; i < px.length; i += 4) tints.add(px[i]);
+  expect(tints.size).toBeGreaterThan(1);
+  expect(Math.max(...tints)).toBeGreaterThan(50); // reached the back half
 });
 
 test("fitSize scales the longest edge, whichever it is", () => {

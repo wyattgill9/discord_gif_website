@@ -93,9 +93,25 @@ const hasAlpha = (data) => {
   return false;
 };
 
+// Pixels to build the clip's palette from: a handful of frames spread across it, so a
+// scene change still gets a vote. Sampled rather than concatenated whole — 300 frames
+// of RGBA is more than quantize needs to find 256 colors.
+const PALETTE_FRAMES = 8;
+export function paletteSource(frames) {
+  const picked = sampleFrames(frames, PALETTE_FRAMES / frames.length);
+  if (picked.length === 1) return picked[0].data;
+  const out = new Uint8ClampedArray(picked.reduce((n, f) => n + f.data.length, 0));
+  let at = 0;
+  for (const f of picked) {
+    out.set(f.data, at);
+    at += f.data.length;
+  }
+  return out;
+}
+
 // frames: [{ data: Uint8ClampedArray RGBA, width, height }], delay in ms per frame.
-// Async only so it can yield to the event loop — quantizing 300 frames on the main
-// thread would otherwise freeze the tab solid with no progress showing.
+// Async only so it can yield to the event loop — a long clip on the main thread would
+// otherwise freeze the tab solid with no progress showing.
 // ponytail: move this into a Worker if it still feels janky; gifenc is worker-safe.
 export async function encode(frames, { delay = 100, dither: useDither = true, onProgress } = {}) {
   if (!frames.length) throw new Error("nothing to encode");
@@ -107,6 +123,17 @@ export async function encode(frames, { delay = 100, dither: useDither = true, on
   // when the source actually needs transparency (PNG emoji, mostly).
   const format = transparent ? "rgba4444" : "rgb565";
 
+  // One palette for the whole clip. Quantizing costs ~200x what applying a palette
+  // does, so a palette per frame was the entire reason a minute of video took minutes
+  // to encode — and consecutive frames share nearly all their colors anyway.
+  // Built from undithered pixels on purpose: the palette should sit on the real colors
+  // and let the dither pattern average toward them, not chase the noise.
+  await new Promise((r) => setTimeout(r)); // paint "Encoding…" before the one big blocking call
+  const palette = quantize(paletteSource(frames), 256, { format, oneBitAlpha: transparent });
+  // Quantizing can drop the fully-transparent entry; -1 would corrupt the frame,
+  // so fall back to writing it opaque.
+  const clearIndex = transparent ? palette.findIndex((c) => c[3] === 0) : -1;
+
   const gif = GIFEncoder();
   let done = 0;
   for (const frame of frames) {
@@ -116,12 +143,7 @@ export async function encode(frames, { delay = 100, dither: useDither = true, on
       ? dither(Uint8ClampedArray.from(frame.data), frame.width)
       : frame.data;
 
-    const palette = quantize(data, 256, { format, oneBitAlpha: transparent });
-    const index = applyPalette(data, palette, format);
-    // Quantizing can drop the fully-transparent entry; -1 would corrupt the frame,
-    // so fall back to writing it opaque.
-    const clearIndex = transparent ? palette.findIndex((c) => c[3] === 0) : -1;
-    gif.writeFrame(index, frame.width, frame.height, {
+    gif.writeFrame(applyPalette(data, palette, format), frame.width, frame.height, {
       palette,
       delay: Math.round(delay),
       transparent: clearIndex >= 0,

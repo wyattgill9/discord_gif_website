@@ -46,20 +46,33 @@ function progress(frac, label) {
 }
 
 // Resolves on `event`, rejects on a media error or if nothing happens at all —
-// a silently hung <video> is the single most confusing failure mode here.
+// a silently hung <video> is the single most confusing failure mode here. The two
+// rejections are told apart because they mean opposite things to the user: a real
+// decode failure is about the file, a timeout is about this tab.
 function once(el, event, ms = 15000) {
   return new Promise((resolve, reject) => {
-    const cleanup = () => {
+    const stop = (finish) => {
       clearTimeout(timer);
       el.removeEventListener(event, ok);
-      el.removeEventListener("error", bad);
+      el.removeEventListener("error", onError);
+      finish();
     };
-    const ok = () => (cleanup(), resolve());
-    const bad = () => (cleanup(), reject(new Error(`video stalled waiting for "${event}"`)));
-    const timer = setTimeout(bad, ms);
+    const ok = () => stop(resolve);
+    const onError = () => stop(() => reject(new Error(`media error waiting for "${event}"`)));
+    const timer = setTimeout(() => stop(() => reject(new Error(`timed out waiting for "${event}"`))), ms);
     el.addEventListener(event, ok, { once: true });
-    el.addEventListener("error", bad, { once: true });
+    el.addEventListener("error", onError, { once: true });
   });
+}
+
+// A <video> keeps its decoder and buffered data until you explicitly empty it — dropping
+// the last JS reference is not enough. Leak enough of them and Chrome quietly stops
+// feeding new ones: `loadstart`, then `stalled`, then nothing, forever.
+function release(video) {
+  if (!video) return;
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
 }
 
 // Canvas' one-shot downscale aliases badly past ~2x, and this app downscales hard
@@ -95,6 +108,7 @@ function reset() {
   $("sel").hidden = true;
   $("preview").removeAttribute("src");
   if (outUrl) URL.revokeObjectURL(outUrl);
+  release(source?.video);
   if (source?.url) URL.revokeObjectURL(source.url);
   outUrl = null;
   source = null;
@@ -118,10 +132,14 @@ async function loadVideo(file) {
     if (!(video.duration > 0) || !Number.isFinite(video.duration))
       throw new Error("Couldn't read this video's length — try re-exporting it as MP4.");
   } catch (err) {
+    release(video);
     URL.revokeObjectURL(url);
-    throw err.message?.startsWith("Couldn't")
-      ? err
-      : new Error("Your browser can't decode this video. Try an MP4 (H.264) or a WebM.");
+    if (err.message?.startsWith("Couldn't")) throw err;
+    throw new Error(
+      err.message?.startsWith("timed out")
+        ? "That video wouldn't open. Reload the page and try it again."
+        : "Your browser can't decode this video. Try an MP4 (H.264) or a WebM.",
+    );
   }
   return {
     kind: "video",
