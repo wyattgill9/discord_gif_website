@@ -17,21 +17,28 @@ export const sizeLadder = [
 const positive = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : 0);
 const atLeast1 = (v) => Math.max(1, Math.round(v));
 
-// Target dimensions. `lock` on: the dimension you typed drives the other via source
-// aspect ratio. `lock` off: both are used verbatim, so the image stretches.
-export function fitSize(src, { width, height, lock = true } = {}) {
-  const aspect = src.width / src.height;
-  let w = positive(width);
-  let h = positive(height);
-  if (lock) {
-    if (w) h = w / aspect;
-    else if (h) w = h * aspect;
-    else ({ width: w, height: h } = src);
-  } else {
-    w ||= src.width;
-    h ||= src.height;
-  }
-  return { width: atLeast1(w), height: atLeast1(h) };
+// Target dimensions. `size` is the longest edge — the other axis follows from `src`'s
+// aspect ratio, so one number is the whole control. No size means src's own dimensions.
+// `src` is any {width, height}, which is what lets a crop rect stand in for the source.
+export function fitSize(src, size) {
+  const long = Math.max(src.width, src.height);
+  const scale = (positive(size) || long) / long;
+  return { width: atLeast1(src.width * scale), height: atLeast1(src.height * scale) };
+}
+
+// Two drag corners (each 0..1 of the displayed image) → a rect in source pixels.
+// Null for a click or a stray twitch, which clears the crop rather than cropping to
+// nothing — same gesture as dismissing a shift+cmd+4 selection.
+export function cropRect(a, b, srcW, srcH, min = 8) {
+  const width = Math.round(Math.abs(b.x - a.x) * srcW);
+  const height = Math.round(Math.abs(b.y - a.y) * srcH);
+  if (width < min || height < min) return null;
+  return {
+    x: Math.round(Math.min(a.x, b.x) * srcW),
+    y: Math.round(Math.min(a.y, b.y) * srcH),
+    width,
+    height,
+  };
 }
 
 // Timestamps (seconds) to sample a video at. Spread across the whole clip, so hitting

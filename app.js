@@ -1,4 +1,4 @@
-import { MAX_FRAMES, encode, fitSize, frameTimes, sampleFrames, sizeLadder } from "./gif.js";
+import { MAX_FRAMES, cropRect, encode, fitSize, frameTimes, sampleFrames, sizeLadder } from "./gif.js";
 
 const $ = (id) => document.getElementById(id);
 const KB = 1024;
@@ -16,12 +16,15 @@ const PRESETS = [
 
 let source = null; // { kind, file, width, height, duration, bitmap? , video?, url? }
 let preset = PRESETS[0];
+let crop = null; // { x, y, width, height } in source pixels, or null for the whole frame
 let outUrl = null;
 let busy = false;
 
 /* ---------- helpers ---------- */
 
-const locked = () => $("lock").getAttribute("aria-pressed") === "true";
+// The region that actually gets converted. Everything downstream — fitSize, drawScaled —
+// takes this instead of `source`, so cropping needs no special case anywhere else.
+const rect = () => crop ?? { x: 0, y: 0, width: source.width, height: source.height };
 
 const fmt = (b) => (b >= MB ? `${(b / MB).toFixed(1)} MB` : `${Math.round(b / KB)} KB`);
 
@@ -62,22 +65,25 @@ function once(el, event, ms = 15000) {
 // Canvas' one-shot downscale aliases badly past ~2x, and this app downscales hard
 // (1920 → 128 for emoji). Halving repeatedly costs almost nothing and looks far better.
 const scratch = [document.createElement("canvas"), document.createElement("canvas")];
-function drawScaled(ctx, src, sw, sh, dw, dh) {
+function drawScaled(ctx, src, r, dw, dh) {
   let cur = src;
-  let cw = sw;
-  let ch = sh;
+  let { x, y, width: cw, height: ch } = r;
   for (let i = 0; cw > dw * 2 && ch > dh * 2; i++) {
-    cw = Math.max(dw, cw >> 1);
-    ch = Math.max(dh, ch >> 1);
+    const nw = Math.max(dw, cw >> 1);
+    const nh = Math.max(dh, ch >> 1);
     const c = scratch[i % 2]; // ping-pong: never read and write the same canvas
-    c.width = cw;
-    c.height = ch;
+    c.width = nw;
+    c.height = nh;
     const cx = c.getContext("2d");
     cx.imageSmoothingQuality = "high";
-    cx.drawImage(cur, 0, 0, cw, ch);
+    cx.drawImage(cur, x, y, cw, ch, 0, 0, nw, nh);
+    // The scratch canvas holds the cropped region already, so the offset is spent.
     cur = c;
+    x = y = 0;
+    cw = nw;
+    ch = nh;
   }
-  ctx.drawImage(cur, 0, 0, dw, dh);
+  ctx.drawImage(cur, x, y, cw, ch, 0, 0, dw, dh);
 }
 
 /* ---------- loading ---------- */
@@ -85,11 +91,14 @@ function drawScaled(ctx, src, sw, sh, dw, dh) {
 function reset() {
   $("out").hidden = true;
   $("controls").hidden = true;
+  $("crop").hidden = true;
+  $("sel").hidden = true;
   $("preview").removeAttribute("src");
   if (outUrl) URL.revokeObjectURL(outUrl);
   if (source?.url) URL.revokeObjectURL(source.url);
   outUrl = null;
   source = null;
+  crop = null;
   setStatus("");
 }
 
@@ -137,6 +146,7 @@ async function load(file) {
     source.file = file;
     $("controls").hidden = false;
     $("fpsRow").hidden = source.kind === "image";
+    drawStage();
     applyPreset();
     await convert();
   } catch (err) {
@@ -149,19 +159,65 @@ async function load(file) {
 function applyPreset() {
   if (!source) return;
   if (preset.fps) $("fps").value = preset.fps;
-  if (!preset.size) return;
-  $("lock").setAttribute("aria-pressed", "true");
-  const long = source.width >= source.height ? { width: preset.size } : { height: preset.size };
-  const t = fitSize(source, long);
-  $("w").value = t.width;
-  $("h").value = t.height;
+  // A preset's `size` is a longest edge and so is the input — nothing to compute, and
+  // it stays correct whatever you crop to.
+  if (preset.size) $("size").value = preset.size;
 }
 
-function syncPair(driver) {
-  if (!source || !locked() || !$(driver).value) return;
-  const t = fitSize(source, driver === "w" ? { width: $("w").value } : { height: $("h").value });
-  $(driver === "w" ? "h" : "w").value = driver === "w" ? t.height : t.width;
+/* ---------- crop ---------- */
+
+// Drawn once, on load. A video sits at t=0 after `loadeddata`, which is the frame we
+// want; convert() seeks it away afterwards, but the selection is a DOM overlay so the
+// canvas never needs redrawing.
+function drawStage() {
+  const view = fitSize(source, Math.min(640, Math.max(source.width, source.height)));
+  const canvas = $("src");
+  canvas.width = view.width;
+  canvas.height = view.height;
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingQuality = "high";
+  const media = source.kind === "image" ? source.bitmap : source.video;
+  drawScaled(ctx, media, { x: 0, y: 0, width: source.width, height: source.height }, view.width, view.height);
+  $("crop").hidden = false;
 }
+
+// Corners are fractions of the displayed box, not pixels: the canvas is CSS-scaled to
+// whatever width the page has, and #sel is positioned in % of the same box, so a crop
+// stays glued to the image through any resize.
+let dragFrom = null;
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+
+function corner(e) {
+  const b = $("src").getBoundingClientRect();
+  return { x: clamp01((e.clientX - b.left) / b.width), y: clamp01((e.clientY - b.top) / b.height) };
+}
+
+function showSel(a, b) {
+  const s = $("sel").style;
+  s.left = `${Math.min(a.x, b.x) * 100}%`;
+  s.top = `${Math.min(a.y, b.y) * 100}%`;
+  s.width = `${Math.abs(b.x - a.x) * 100}%`;
+  s.height = `${Math.abs(b.y - a.y) * 100}%`;
+  $("sel").hidden = false;
+}
+
+$("src").onpointerdown = (e) => {
+  if (!source) return;
+  $("src").setPointerCapture(e.pointerId); // keep the drag alive outside the canvas
+  dragFrom = corner(e);
+  $("sel").hidden = true;
+};
+$("src").onpointermove = (e) => dragFrom && showSel(dragFrom, corner(e));
+$("src").onpointerup = (e) => {
+  if (!dragFrom) return;
+  const [from, to] = [dragFrom, corner(e)];
+  dragFrom = null;
+  crop = cropRect(from, to, source.width, source.height);
+  if (crop) showSel(from, to);
+  else $("sel").hidden = true; // a click clears the crop
+  convert();
+};
+$("src").onpointercancel = () => (dragFrom = null);
 
 for (const p of PRESETS) {
   const chip = document.createElement("button");
@@ -186,12 +242,6 @@ $("drop").onkeydown = (e) => {
   if (e.key === "Enter" || e.key === " ") (e.preventDefault(), $("file").click());
 };
 $("file").onchange = () => $("file").files[0] && load($("file").files[0]);
-$("w").oninput = () => syncPair("w");
-$("h").oninput = () => syncPair("h");
-$("lock").onclick = () => {
-  $("lock").setAttribute("aria-pressed", String(!locked()));
-  syncPair("w");
-};
 $("go").onclick = () => convert();
 
 for (const ev of ["dragenter", "dragover", "dragleave", "drop"]) {
@@ -221,7 +271,7 @@ async function decode(target, times) {
   ctx.imageSmoothingQuality = "high";
 
   if (source.kind === "image") {
-    drawScaled(ctx, source.bitmap, source.width, source.height, target.width, target.height);
+    drawScaled(ctx, source.bitmap, rect(), target.width, target.height);
     return [ctx.getImageData(0, 0, target.width, target.height)];
   }
 
@@ -234,7 +284,7 @@ async function decode(target, times) {
       await once(source.video, "seeked");
     }
     ctx.clearRect(0, 0, target.width, target.height);
-    drawScaled(ctx, source.video, source.width, source.height, target.width, target.height);
+    drawScaled(ctx, source.video, rect(), target.width, target.height);
     out.push(ctx.getImageData(0, 0, target.width, target.height));
     progress((i + 1) / times.length, "Reading frames");
     await tick();
@@ -255,7 +305,7 @@ function rescale(frames, w, h) {
     src.height = f.height;
     sctx.putImageData(f, 0, 0);
     dctx.clearRect(0, 0, w, h);
-    drawScaled(dctx, src, f.width, f.height, w, h);
+    drawScaled(dctx, src, { x: 0, y: 0, width: f.width, height: f.height }, w, h);
     return dctx.getImageData(0, 0, w, h);
   });
 }
@@ -265,11 +315,7 @@ async function convert() {
   busy = true;
   $("go").disabled = true;
   try {
-    const target = fitSize(source, {
-      width: $("w").value,
-      height: $("h").value,
-      lock: locked(),
-    });
+    const target = fitSize(rect(), $("size").value);
     const fps = Math.min(50, Math.max(1, Number($("fps").value) || 15));
     const useDither = $("dither").checked;
 

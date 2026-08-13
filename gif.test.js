@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { dither, encode, fitSize, frameTimes, sampleFrames } from "./gif.js";
+import { cropRect, dither, encode, fitSize, frameTimes, sampleFrames } from "./gif.js";
 
 // Synthetic RGBA frame — a horizontal gradient, which is exactly what banding shows up on.
 const frame = (w, h, tint = 0, alpha = 255) => {
@@ -30,31 +30,27 @@ test("a transparent source still encodes", async () => {
   expect(Array.from(bytes.slice(0, 6))).toEqual([...Buffer.from("GIF89a")]);
 });
 
-test("fitSize keeps aspect when locked", () => {
-  expect(fitSize({ width: 1920, height: 1080 }, { width: 480, lock: true })).toEqual({
-    width: 480,
-    height: 270,
-  });
-  expect(fitSize({ width: 1920, height: 1080 }, { height: 270, lock: true })).toEqual({
-    width: 480,
-    height: 270,
-  });
-});
-
-test("fitSize stretches when unlocked", () => {
-  expect(fitSize({ width: 1920, height: 1080 }, { width: 300, height: 100, lock: false })).toEqual({
-    width: 300,
-    height: 100,
-  });
+test("fitSize scales the longest edge, whichever it is", () => {
+  expect(fitSize({ width: 1920, height: 1080 }, 480)).toEqual({ width: 480, height: 270 });
+  expect(fitSize({ width: 1080, height: 1920 }, 480)).toEqual({ width: 270, height: 480 });
 });
 
 test("fitSize falls back to source size and never returns 0", () => {
-  expect(fitSize({ width: 640, height: 480 }, {})).toEqual({ width: 640, height: 480 });
-  expect(fitSize({ width: 640, height: 480 }, { width: "", height: "", lock: false })).toEqual({
-    width: 640,
-    height: 480,
-  });
-  expect(fitSize({ width: 640, height: 480 }, { width: 0.4, lock: false }).width).toBe(1);
+  expect(fitSize({ width: 640, height: 480 })).toEqual({ width: 640, height: 480 });
+  expect(fitSize({ width: 640, height: 480 }, "")).toEqual({ width: 640, height: 480 });
+  expect(fitSize({ width: 640, height: 480 }, 0.4).width).toBe(1);
+});
+
+test("cropRect normalizes either drag direction into source pixels", () => {
+  const box = { x: 200, y: 120, width: 400, height: 240 };
+  // Top-left → bottom-right, and the same box dragged bottom-right → top-left.
+  expect(cropRect({ x: 0.25, y: 0.25 }, { x: 0.75, y: 0.75 }, 800, 480)).toEqual(box);
+  expect(cropRect({ x: 0.75, y: 0.75 }, { x: 0.25, y: 0.25 }, 800, 480)).toEqual(box);
+});
+
+test("cropRect rejects a click or a twitch", () => {
+  expect(cropRect({ x: 0.5, y: 0.5 }, { x: 0.5, y: 0.5 }, 800, 480)).toBeNull();
+  expect(cropRect({ x: 0.5, y: 0.5 }, { x: 0.502, y: 0.9 }, 800, 480)).toBeNull(); // ~2px wide
 });
 
 test("frameTimes samples at fps and caps at maxFrames", () => {
